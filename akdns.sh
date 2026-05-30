@@ -37,6 +37,8 @@ DNS_LIST=(
 
 # ---- 运行时状态 ----
 BEST_DNS=""
+# 当 UDP 测速全部超时时自动置 true：应用时写入 `options use-vc` 强制走 TCP
+DNS_USE_TCP=false
 DISTRO_ID="unknown"
 DISTRO_NAME="Unknown"
 DISTRO_VERSION=""
@@ -189,11 +191,16 @@ safe_write_resolv_conf() {
     _swrc_cleanup; return 1
   fi
 
-  # 保留非 nameserver 行
+  # 保留非 nameserver / 非本脚本管理的 options 行
   if [[ -f /etc/resolv.conf ]] && [[ ! -L /etc/resolv.conf ]]; then
-    grep -v '^nameserver' /etc/resolv.conf > "$tmpfile" 2>/dev/null || true
+    grep -vE '^nameserver|^options use-vc' /etc/resolv.conf > "$tmpfile" 2>/dev/null || true
   fi
   echo "nameserver $dns_ip" >> "$tmpfile"
+  # UDP 被封锁时，强制所有解析走 TCP（glibc resolver 遵守 use-vc）
+  if ${DNS_USE_TCP:-false}; then
+    echo "options use-vc" >> "$tmpfile"
+    log_info "已写入 options use-vc：强制 DNS 走 TCP"
+  fi
 
   # 原子替换（mv 可直接覆盖 symlink，无需先 rm）
   chmod 644 "$tmpfile" || { log_error "无法设置临时文件权限"; _swrc_cleanup; return 1; }
@@ -892,15 +899,32 @@ reload_dns_service() {
 # 验证系统 DNS 是否生效（走系统 resolver，而非指定 @server）
 verify_system_dns() {
   sleep 1
-  if ! command -v dig &>/dev/null; then
+  log_info "验证系统 DNS 解析..."
+
+  local tcp_note=""
+  ${DNS_USE_TCP:-false} && tcp_note="（TCP）"
+
+  # 优先用 getent：走 glibc resolver，会遵守 resolv.conf 的 options use-vc（TCP）
+  if command -v getent &>/dev/null; then
+    if getent hosts "$DOMAIN" &>/dev/null; then
+      log_success "系统 DNS 解析验证通过${tcp_note}"
+      return 0
+    fi
+  fi
+
+  # 回退到 dig；TCP 模式下显式加 +tcp（dig 默认走 UDP，不读 use-vc）
+  if command -v dig &>/dev/null; then
+    local digargs="+short +time=3 +tries=1"
+    ${DNS_USE_TCP:-false} && digargs="+tcp $digargs"
+    if dig $digargs "$DOMAIN" &>/dev/null; then
+      log_success "系统 DNS 解析验证通过${tcp_note}"
+      return 0
+    fi
+    log_warn "系统 DNS 解析验证失败，请检查配置"
     return 0
   fi
-  log_info "验证系统 DNS 解析..."
-  if dig +short +time=3 +tries=1 "$DOMAIN" &>/dev/null; then
-    log_success "系统 DNS 解析验证通过"
-  else
-    log_warn "系统 DNS 解析验证失败，请检查配置"
-  fi
+
+  return 0
 }
 
 # ============================================================
@@ -977,6 +1001,35 @@ apply_perm() {
 # 测速逻辑
 # ============================================================
 
+# 测量所有 AKDNS 节点的平均响应时间。
+#   $1: 传输标签(udp/tcp，仅用于命名)  $2: 传给 dig 的额外参数（"" 或 "+tcp"）
+# 输出: 已按延迟升序排列的 "avg dns" 行；avg=1000 表示该节点本轮全部超时。
+measure_dns_transport() {
+  local extra="${2:-}"
+  local tmpdir
+  tmpdir=$(mktemp -d) || return 1
+
+  local dns i
+  for dns in "${DNS_LIST[@]}"; do
+    for ((i = 1; i <= COUNT; i++)); do
+      (
+        local t
+        t=$(dig @"$dns" "$DOMAIN" $extra +stats +time="$TIMEOUT" +tries=1 2>/dev/null \
+          | awk '/Query time/ {print $4}')
+        if [[ -n "$t" ]]; then echo "$dns $t"; else echo "$dns 1000"; fi
+      ) > "$tmpdir/result_${dns}_${i}" &
+    done
+  done
+  wait
+
+  cat "$tmpdir"/result_* 2>/dev/null | awk '
+    { sum[$1] += $2; cnt[$1]++ }
+    END { for (d in sum) printf "%d %s\n", sum[d] / cnt[d], d }
+  ' | sort -n
+
+  rm -rf "$tmpdir"
+}
+
 run_speed_test() {
   if ! command -v dig &>/dev/null; then
     log_error "未找到 dig 命令"
@@ -991,89 +1044,71 @@ run_speed_test() {
     return 1
   fi
 
-  local tmpdir
-  tmpdir=$(mktemp -d) || { log_error "无法创建临时目录"; return 1; }
-
-  # 确保函数退出时清理临时目录
-  trap 'rm -rf "$tmpdir"' RETURN
-
   echo ""
   printf '%b\n' "${BOLD}AKDNS 测速${NC}"
   echo "域名   : $DOMAIN"
   echo "次数   : $COUNT"
   echo "超时   : ${TIMEOUT}s"
   echo "------------------------------------"
-  echo "正在测速，请稍候..."
 
-  # 每个子进程写独立文件，避免并发写同一文件
-  for dns in "${DNS_LIST[@]}"; do
-    for ((i = 1; i <= COUNT; i++)); do
-      (
-        local t
-        t=$(dig @"$dns" "$DOMAIN" +stats +time="$TIMEOUT" +tries=1 2>/dev/null \
-          | awk '/Query time/ {print $4}')
-        if [[ -n "$t" ]]; then
-          echo "$dns $t"
-        else
-          echo "$dns 1000"
-        fi
-      ) > "$tmpdir/result_${dns}_${i}" &
-    done
-  done
+  # 每次测速重新判定传输方式
+  DNS_USE_TCP=false
+  local transport="UDP"
 
-  wait
+  echo "正在测试 UDP DNS 连通性，请稍候..."
+  local result
+  result=$(measure_dns_transport udp "")
 
-  # 汇总所有结果文件
-  cat "$tmpdir"/result_* > "$tmpdir/result" 2>/dev/null
-
-  if [[ ! -s "$tmpdir/result" ]]; then
-    log_error "测速失败，未获取到任何结果"
-    rm -rf "$tmpdir"
-    return 1
+  # UDP 全部超时 → 自动回退到 TCP（常见于网络封锁 UDP/53 但放行 TCP/53）
+  local best_avg
+  best_avg=$(echo "$result" | head -n1 | awk '{print $1}')
+  if [[ -z "$result" ]] || (( ${best_avg:-1000} >= 1000 )); then
+    log_warn "UDP DNS 全部超时，尝试改用 TCP 重新测试..."
+    echo "正在测试 TCP DNS 连通性，请稍候..."
+    local tcp_result tcp_best_avg
+    tcp_result=$(measure_dns_transport tcp "+tcp")
+    tcp_best_avg=$(echo "$tcp_result" | head -n1 | awk '{print $1}')
+    if [[ -n "$tcp_result" ]] && (( ${tcp_best_avg:-1000} < 1000 )); then
+      result="$tcp_result"
+      DNS_USE_TCP=true
+      transport="TCP"
+      log_success "TCP DNS 可用，将以 TCP 模式应用（写入 options use-vc）"
+      if [[ "$DISTRO_ID" == "alpine" ]]; then
+        log_warn "检测到 Alpine/musl：musl libc 可能不支持 options use-vc，强制 TCP 或不生效"
+      fi
+    fi
   fi
 
   echo ""
-  printf '%b\n' "${BOLD}AKDNS 节点连通性 / 平均延迟:${NC}"
+  printf '%b\n' "${BOLD}AKDNS 节点连通性 / 平均延迟（${transport}）:${NC}"
   echo "------------------------------------"
-
-  local result
-  result=$(awk '
-  {
-    sum[$1] += $2
-    cnt[$1]++
-  }
-  END {
-    for (dns in sum) {
-      avg = sum[dns] / cnt[dns]
-      printf "%d %s\n", avg, dns
-    }
-  }
-  ' "$tmpdir/result" | sort -n)
-
-  # avg>=1000 视为该次全部超时，标记为不可达
+  # avg>=1000 视为该节点全部超时，标记为不可达
   echo "$result" | awk '{
     if ($1 + 0 >= 1000) printf "  %-18s %s\n", $2, "超时 / 不可达 ✗";
     else                printf "  %-18s %s ms  ✓\n", $2, $1;
   }'
 
-  # 检查最佳 DNS 是否全部超时（avg >= 1000 表示全部失败）
-  local best_avg best_dns
+  local best_dns
   best_avg=$(echo "$result" | head -n1 | awk '{print $1}')
   best_dns=$(echo "$result" | head -n1 | awk '{print $2}')
 
-  if [[ -z "$best_dns" ]] || (( best_avg >= 1000 )); then
+  if [[ -z "$best_dns" ]] || (( ${best_avg:-1000} >= 1000 )); then
     echo "------------------------------------"
-    log_error "所有 DNS 测速均超时，未能选出可用 DNS"
+    log_error "UDP 与 TCP 测速均超时，未能选出可用 DNS"
     BEST_DNS=""
+    DNS_USE_TCP=false
     return 1
   fi
 
   BEST_DNS="$best_dns"
 
   echo "------------------------------------"
-  printf '%b\n' "  最佳 DNS: ${GREEN}${BOLD}$BEST_DNS${NC} (${best_avg}ms)"
+  printf '%b\n' "  最佳 DNS: ${GREEN}${BOLD}$BEST_DNS${NC} (${best_avg}ms, ${transport})"
+  if $DNS_USE_TCP; then
+    printf '%b\n' "  ${YELLOW}传输方式: 强制 TCP —— 应用时会写入 options use-vc${NC}"
+  fi
   echo ""
-  log_info "可选择菜单 2 或 3 来应用此 DNS"
+  log_info "可选择菜单 3（设为系统 DNS）或 4（一键测速并应用）"
 }
 
 # ============================================================
@@ -1132,6 +1167,9 @@ menu_apply() {
   else
     echo "  当前后端 : $DNS_BACKEND_PERM"
     echo "  接管方式 : 停用上述管理器 → 直接写入 /etc/resolv.conf"
+    if ${DNS_USE_TCP:-false}; then
+      echo "  传输方式 : 强制 TCP (options use-vc) —— UDP 已全部超时"
+    fi
     if $LOCK_RESOLV_CONF; then
       echo "  防覆盖   : 锁定 /etc/resolv.conf (chattr +i)"
     fi
@@ -1280,6 +1318,11 @@ show_status() {
   # 缓存的测速结果
   if [[ -n "$BEST_DNS" ]]; then
     printf "  %-16s %s\n" "最佳 DNS(缓存):" "$BEST_DNS"
+  fi
+
+  # 当前 resolv.conf 是否已强制 TCP
+  if grep -q '^options use-vc' /etc/resolv.conf 2>/dev/null; then
+    printf "  %-16s %s\n" "DNS 传输:" "TCP (options use-vc)"
   fi
 
   echo ""
