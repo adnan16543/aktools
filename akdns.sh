@@ -21,8 +21,8 @@ TIMEOUT=1
 # 还原（菜单「还原 DNS 配置」）会自动解锁。
 LOCK_RESOLV_CONF=true
 
-# AKDNS 控制台地址（用于脚本内提示，部署时请改成你的实际域名）
-CONSOLE_URL="https://akdns.akile.io/console"
+# AKDNS 控制台地址（用于脚本内提示）
+CONSOLE_URL="https://dns.akile.ai/console"
 
 DNS_LIST=(
   "66.66.66.66"
