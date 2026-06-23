@@ -1767,12 +1767,12 @@ inject_akdns_unlock_context() {
     {
       if ($0 ~ /\[商家\]TG群组/) {
         sub(/\[商家\]TG群组/, "第三方脚本 TG 群组（非 AKDNS 官方群）")
-      }
-      print
-      if (!done && $0 ~ /^function ScriptTitle\(\)[[:space:]]*\{/) {
+        print
         emit_context()
         done = 1
+        next
       }
+      print
     }
     END {
       if (!done) {
