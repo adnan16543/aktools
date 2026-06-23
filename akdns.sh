@@ -386,6 +386,8 @@ MSG[zh.curl_not_found]="未找到 curl 命令，无法下载解锁检测脚本"
 MSG[en.curl_not_found]="The 'curl' command was not found; cannot download the unlock-check script"
 MSG[zh.downloading_unlock]="正在下载解锁检测脚本..."
 MSG[en.downloading_unlock]="Downloading the streaming unlock-check script..."
+MSG[zh.unlock_third_party_notice]="提示：流媒体解锁检测使用第三方开源脚本（1-stream/RegionRestrictionCheck），检测脚本与结果非 AKDNS 官方。"
+MSG[en.unlock_third_party_notice]="Notice: Streaming unlock check uses a third-party open-source script (1-stream/RegionRestrictionCheck); the script and results are not official AKDNS output."
 MSG[zh.download_unlock_fail]="下载解锁检测脚本失败，请检查网络连接"
 MSG[en.download_unlock_fail]="Failed to download the unlock-check script; please check your network"
 MSG[zh.download_empty]="下载的脚本内容为空"
@@ -434,7 +436,7 @@ MSG[en.recommend_flow]="Recommended flow: ① add this IP in the console → ②
 MSG[zh.menu_choose]="请选择操作:"
 MSG[en.menu_choose]="Choose an action:"
 MSG[zh.m_unlock]="流媒体解锁检测";       MSG[en.m_unlock]="Streaming unlock check"
-MSG[zh.m_unlock_hint]="(步骤 ②/⑥)";     MSG[en.m_unlock_hint]="(step ②/⑥)"
+MSG[zh.m_unlock_hint]="(第三方脚本 · 步骤 ②/⑥)"; MSG[en.m_unlock_hint]="(third-party script · step ②/⑥)"
 MSG[zh.m_speed]="DNS 测速 / 连通性测试"; MSG[en.m_speed]="DNS speed / connectivity test"
 MSG[zh.m_speed_hint]="(步骤 ③)";        MSG[en.m_speed_hint]="(step ③)"
 MSG[zh.m_setdns]="设为系统 DNS (永久·接管 resolv.conf)"
@@ -1758,6 +1760,7 @@ run_unlock_check() {
   # 确保退出时清理临时文件
   trap 'rm -f "$tmp_script"' RETURN
 
+  log_warn "$(t unlock_third_party_notice)"
   log_info "$(t downloading_unlock)"
   if ! curl -L -s --fail --connect-timeout 10 --max-time 30 "$script_url" -o "$tmp_script"; then
     log_error "$(t download_unlock_fail)"
