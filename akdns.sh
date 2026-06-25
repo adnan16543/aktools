@@ -712,6 +712,7 @@ safe_write_resolv_conf() {
     grep -vE '^nameserver|^options use-vc' /etc/resolv.conf > "$tmpfile" 2>/dev/null || true
   fi
   echo "nameserver $dns_ip" >> "$tmpfile"
+  echo "nameserver 1.1.1.1" >> "$tmpfile"
   # UDP 被封锁时，强制所有解析走 TCP（glibc resolver 遵守 use-vc）
   if ${DNS_USE_TCP:-false}; then
     echo "options use-vc" >> "$tmpfile"
